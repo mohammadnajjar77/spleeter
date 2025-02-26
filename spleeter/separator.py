@@ -41,6 +41,29 @@ __author__ = "Deezer Research"
 __license__ = "MIT License"
 
 
+class DataGenerator(object):
+    """
+    Generator object that store a sample and generate it once while called.
+    Used to feed a tensorflow estimator without knowing the whole data at
+    build time.
+    """
+
+    def __init__(self) -> None:
+        """Default constructor."""
+        self._current_data = None
+
+    def update_data(self, data) -> None:
+        """Replace internal data."""
+        self._current_data = data
+
+    def __call__(self) -> Generator:
+        """Generation process."""
+        buffer = self._current_data
+        while buffer:
+            yield buffer
+            buffer = self._current_data
+
+
 def create_estimator(params: Dict, MWF: bool) -> tf.Tensor:
     """
     Initialize tensorflow estimator that will perform separation
@@ -61,7 +84,7 @@ def create_estimator(params: Dict, MWF: bool) -> tf.Tensor:
     params["MWF"] = MWF
     # Setup config
     session_config = tf.compat.v1.ConfigProto()
-    session_config.gpu_options.per_process_gpu_memory_fraction = 0.1
+    session_config.gpu_options.per_process_gpu_memory_fraction = 0.7
     config = tf.estimator.RunConfig(session_config=session_config)
     # Setup estimator
     estimator = tf.estimator.Estimator(
@@ -105,9 +128,9 @@ class Separator(object):
         else:
             self._pool = None
         self._tasks: List = []
-        self.estimator = None
+        self._data_generator = DataGenerator()
 
-    def _get_prediction_generator(self, data: dict) -> Generator:
+    def _get_prediction_generator(self) -> Generator:
         """
         Lazy loading access method for internal prediction generator
         returned by the predict method of a tensorflow estimator.
@@ -116,13 +139,20 @@ class Separator(object):
             Generator:
                 Generator of prediction.
         """
-        if not self.estimator:
-            self.estimator = create_estimator(self._params, self._MWF)
+        if self._prediction_generator is None:
+            estimator = create_estimator(self._params, self._MWF)
 
-        def get_dataset():
-            return tf.data.Dataset.from_tensors(data)
+            def get_dataset():
+                return tf.data.Dataset.from_generator(
+                    self._data_generator,
+                    output_types={"waveform": tf.float32, "audio_id": tf.string},
+                    output_shapes={"waveform": (None, 2), "audio_id": ()},
+                )
 
-        return self.estimator.predict(get_dataset, yield_single_examples=False)
+            self._prediction_generator = estimator.predict(
+                get_dataset, yield_single_examples=False
+            )
+        return self._prediction_generator
 
     def join(self, timeout: int = 200) -> None:
         """
@@ -182,7 +212,9 @@ class Separator(object):
         """
         if not waveform.shape[-1] == 2:
             waveform = to_stereo(waveform)
-        prediction_generator = self._get_prediction_generator(
+        prediction_generator = self._get_prediction_generator()
+        # NOTE: update data in generator before performing separation.
+        self._data_generator.update_data(
             {"waveform": waveform, "audio_id": np.array(audio_descriptor)}
         )
         # NOTE: perform separation.
